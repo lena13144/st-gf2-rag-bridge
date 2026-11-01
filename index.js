@@ -3,8 +3,10 @@ import {
     extension_prompt_roles,
     saveSettingsDebounced,
     setExtensionPrompt,
+    eventSource,
+    event_types,
 } from '../../../../script.js';
-import { extension_settings } from '../../../extensions.js';
+import { extension_settings, getContext } from '../../../extensions.js';
 
 const MODULE_NAME = 'gf2_rag_bridge';
 const PROMPT_TAG = 'gf2_rag_context';
@@ -60,30 +62,93 @@ function buildApiConfig(cfg) {
     return out;
 }
 
-globalThis.gf2RagInterceptor = async function (chat, _contextSize, _abort, type) {
-    const cfg = getSettings();
-    if (!cfg.enabled || type === 'quiet') {
-        setExtensionPrompt(PROMPT_TAG, '', extension_prompt_types.IN_CHAT, cfg.depth, false, extension_prompt_roles.SYSTEM);
-        return;
+// 数据库/世界书本轮选取完成后（WORLDINFO_ENTRIES_LOADED）再跑检索——
+// context 吃本轮选中的全部条目（含数据库纪要），驱动"前世记忆"召回
+function collectActivatedEntries(loreData) {
+    const texts = [];
+    const push = (x) => {
+        if (!x) return;
+        if (typeof x === 'string' && x.trim()) texts.push(x);
+        else if (x.content && typeof x.content === 'string') texts.push(x.content);
+    };
+    const walk = (obj) => {
+        if (!obj) return;
+        if (Array.isArray(obj)) { obj.forEach(push); return; }
+        if (obj instanceof Set || obj instanceof Map) { walk([...obj]); return; }
+        if (typeof obj === 'object') {
+            if (Array.isArray(obj.entries)) obj.entries.forEach(walk);
+            else if (obj.entries instanceof Set || obj.entries instanceof Map) walk([...obj.entries]);
+            if (Array.isArray(obj.allActivatedEntries)) obj.allActivatedEntries.forEach(walk);
+            else if (obj.allActivatedEntries instanceof Set) walk([...obj.allActivatedEntries]);
+        }
+    };
+    for (const key of ['globalLore', 'characterLore', 'charLore', 'chatLore', 'personaLore', 'entries']) walk(loreData?.[key]);
+    if (!texts.length) walk(loreData);
+    return texts;
+}
+
+async function genKeywordsViaDbPreset(cfg, query, context) {
+    const shujuku = extension_settings?.shujuku_v120__userscript_settings_v1 || extension_settings?.shujuku_v104__userscript_settings_v1;
+    let dbApi = null;
+    for (const [k, v] of Object.entries(shujuku || {})) {
+        if (k.endsWith('_settings') && typeof v === 'string') { try { dbApi = JSON.parse(v)?.apiConfig || dbApi; } catch (e) {} }
     }
+    const base = (dbApi?.url || cfg.chatBase || '').replace(/\/+$/, '');
+    const key = dbApi?.apiKey || cfg.chatKey || '';
+    const model = dbApi?.model || cfg.chatModel || 'deepseek-v4.1-flash-1017';
+    if (!base || !key) return { skip: true, kws: [] };
+    const msgs = [
+        { role: 'system', content: '你是交火关键词生成助手。根据用户输入与剧情纪要，输出最相关的简洁关键词或短语用于检索召回，关键词只能放在 <keywords> 标签内，用中文逗号分隔；若纯属日常闲聊无需检索则输出 NONE。' },
+        { role: 'user', content: (context ? context + '\n\n' : '') + '当前用户输入：\n' + query + '\n\n请输出 <keywords>。' },
+    ];
+    const resp = await fetch(base + '/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+        body: JSON.stringify({ model, messages: msgs, temperature: 0.1, max_tokens: 450 }),
+    });
+    if (!resp.ok) return { skip: false, kws: [] };
+    const text = (await resp.json())?.choices?.[0]?.message?.content || '';
+    const km = text.match(/<keywords>([\s\S]*?)<\/keywords>/i) || text.match(/关键词[：:]([\s\S]+)$/);
+    if (!km) return { skip: false, kws: [] };
+    const raw = km[1].trim();
+    if (/^none$/i.test(raw)) return { skip: true, kws: [] };
+    return { skip: false, kws: raw.split(/[，,、]/).map(x => x.trim()).filter(Boolean) };
+}
 
-    const recent = (chat || []).filter(m => !m.is_system && m.mes).slice(-4);
-    if (!recent.length) return;
-
-    const lastMsg = cleanMessage(recent[recent.length - 1].mes);
-    if (!lastMsg || lastMsg.length < 2) return;
-
-    const contextMsgs = recent.slice(0, -1).map(m => `${m.name}: ${cleanMessage(m.mes).slice(0, 250)}`).join('\n');
-    const server = (cfg.ragServer || 'http://127.0.0.1:5240').replace(/\/+$/, '');
-
+let gf2RagRunning = false;
+async function runRagRetrieval(loreData) {
+    const cfg = getSettings();
+    if (!cfg.enabled || gf2RagRunning) return;
+    gf2RagRunning = true;
+    const clear = () => setExtensionPrompt(PROMPT_TAG, '', extension_prompt_types.IN_CHAT, 0, false, extension_prompt_roles.SYSTEM);
     try {
+        const ctx = getContext();
+        const chat = ctx?.chat || [];
+        const lastUserMsg = chat.filter(m => m.is_user && m.mes).slice(-1)[0];
+        const query = lastUserMsg ? cleanMessage(lastUserMsg.mes).slice(0, 500) : '';
+        if (!query) { clear(); return; }
+
+        const entryTexts = collectActivatedEntries(loreData);
+        const context = entryTexts.length
+            ? '【本轮世界书/纪要注入】\n' + entryTexts.join('\n').replace(/<[^>]+>/g, '')
+            : '';
+
+        let kws = [];
+        if (cfg.augment) {
+            try {
+                const gk = await genKeywordsViaDbPreset(cfg, query, context);
+                if (gk.skip) { console.debug('[GF2-RAG] gatekeeper: NONE'); clear(); return; }
+                kws = gk.kws;
+            } catch (e) { console.warn('[GF2-RAG] keyword gen failed, fallback to raw query', e); }
+        }
+
+        const server = (cfg.ragServer || 'http://127.0.0.1:5240').replace(/\/+$/, '');
         const resp = await fetch(`${server}/search`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                query: lastMsg.slice(0, 500),
-                context: contextMsgs,
-                augment: cfg.augment,
+                query, context, keywords: kws,
+                augment: false,
                 useRerank: cfg.useRerank,
                 k: cfg.topK,
                 apiConfig: buildApiConfig(cfg),
@@ -93,26 +158,26 @@ globalThis.gf2RagInterceptor = async function (chat, _contextSize, _abort, type)
         const data = await resp.json();
 
         if (data.rerank === 'skipped_by_gatekeeper' || !Array.isArray(data.results) || !data.results.length) {
-            console.log('[GF2-RAG] Skipped or empty results', data);
-            setExtensionPrompt(PROMPT_TAG, '', extension_prompt_types.IN_CHAT, cfg.depth, false, extension_prompt_roles.SYSTEM);
-            return;
+            clear(); return;
         }
-
         const hits = data.results.filter(r => r.score >= cfg.minScore);
-        if (!hits.length) {
-            setExtensionPrompt(PROMPT_TAG, '', extension_prompt_types.IN_CHAT, cfg.depth, false, extension_prompt_roles.SYSTEM);
-            return;
-        }
+        if (!hits.length) { clear(); return; }
 
         const block = hits.map((h, i) => `【原文片段 ${i + 1} | ${h.tag || h.group}】\n${h.text}`).join('\n\n');
-        const promptText = `<gf2_source_reference>\n以下是检索到的《少女前线2：追放》相关原作台词与设定片段，仅供剧情事实、细节与角色声口参考（请自然融入扮演，不要照搬旁白或复读）：\n\n${block}\n</gf2_source_reference>`;
-
-        console.log(`[GF2-RAG] Injected ${hits.length} chunks (${data.took_ms}ms) keywords:`, data.keywords);
-        setExtensionPrompt(PROMPT_TAG, promptText, extension_prompt_types.IN_CHAT, cfg.depth, false, extension_prompt_roles.SYSTEM);
+        const promptText = `<gf2_source_reference>\n以下是检索到的《少女前线2：追放》原作台词与设定片段（{{user}}的潜在记忆素材），请作为既视感/闪回自然融入扮演，不要照搬旁白或复读：\n\n${block}\n</gf2_source_reference>`;
+        console.log(`[GF2-RAG] Injected ${hits.length} chunks (${data.took_ms}ms) kws:`, data.keywords);
+        setExtensionPrompt(PROMPT_TAG, promptText, extension_prompt_types.IN_CHAT, 0, false, extension_prompt_roles.SYSTEM);
     } catch (err) {
-        console.warn('[GF2-RAG] Search failed (is serve.js running on :5240?):', err);
+        console.warn('[GF2-RAG] retrieval failed:', err);
+    } finally {
+        gf2RagRunning = false;
     }
-};
+}
+
+eventSource.on(event_types.WORLDINFO_ENTRIES_LOADED, async (loreData) => {
+    try { await runRagRetrieval(loreData); }
+    catch (e) { console.warn('[GF2-RAG]', e); }
+});
 
 jQuery(async () => {
     const cfg = getSettings();
