@@ -7,6 +7,8 @@ import {
     event_types,
 } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
+import { SlashCommand } from '../../slash-commands/SlashCommand.js';
+import { SlashCommandParser } from '../../slash-commands/SlashCommandParser.js';
 
 const MODULE_NAME = 'gf2_rag_bridge';
 const PROMPT_TAG = 'gf2_rag_context';
@@ -182,6 +184,23 @@ eventSource.on(event_types.WORLDINFO_ENTRIES_LOADED, async (loreData) => {
 jQuery(async () => {
     const cfg = getSettings();
     const server = (cfg.ragServer || 'http://127.0.0.1:5240').replace(/\/+$/, '');
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'gf2rag',
+        returns: 'GF2 RAG 检索开关状态',
+        callback: (_args, value) => {
+            const v = String(value || '').trim().toLowerCase();
+            if (v === 'on' || v === '1' || v === 'true') cfg.enabled = true;
+            else if (v === 'off' || v === '0' || v === 'false') cfg.enabled = false;
+            else cfg.enabled = !cfg.enabled;
+            saveSettingsDebounced();
+            const el = $('#gf2_rag_enabled');
+            if (el.length) el.prop('checked', cfg.enabled);
+            toastr.info(`GF2 原文检索：${cfg.enabled ? '已开启' : '已关闭'}`);
+            return cfg.enabled ? 'on' : 'off';
+        },
+        helpString: 'GF2 原文检索桥开关：/gf2rag on|off（不带参数则切换）',
+    }));
 
     try {
         const r = await fetch(`${server}/config`);
