@@ -1,0 +1,10 @@
+{
+  "display_name": "GF2 原文检索桥 (RAG Bridge)",
+  "loading_order": 50,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "author": "Devin",
+  "version": "1.0.0",
+  "generate_interceptor": "gf2RagInterceptor"
+}

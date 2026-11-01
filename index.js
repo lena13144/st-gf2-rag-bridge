@@ -1,0 +1,304 @@
+import {
+    extension_prompt_types,
+    extension_prompt_roles,
+    saveSettingsDebounced,
+    setExtensionPrompt,
+} from '../../../../script.js';
+import { extension_settings } from '../../../extensions.js';
+
+const MODULE_NAME = 'gf2_rag_bridge';
+const PROMPT_TAG = 'gf2_rag_context';
+
+const defaultSettings = {
+    enabled: true,
+    ragServer: 'http://127.0.0.1:5240',
+    augment: false,
+    useRerank: true,
+    topK: 3,
+    minScore: 0.35,
+    depth: 1,
+    chatBase: 'https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1',
+    chatKey: '',
+    chatModel: 'deepseek-v4.1-flash-1017',
+    embedBase: 'https://api.siliconflow.cn/v1',
+    embedKey: '',
+    embedModel: 'Qwen/Qwen3-Embedding-8B',
+    rerankModel: 'Qwen/Qwen3-Reranker-8B',
+};
+
+function getSettings() {
+    if (!extension_settings[MODULE_NAME]) {
+        extension_settings[MODULE_NAME] = { ...defaultSettings };
+    } else {
+        for (const [k, v] of Object.entries(defaultSettings)) {
+            if (extension_settings[MODULE_NAME][k] === undefined) {
+                extension_settings[MODULE_NAME][k] = v;
+            }
+        }
+    }
+    return extension_settings[MODULE_NAME];
+}
+
+function cleanMessage(mes) {
+    if (!mes) return '';
+    return String(mes)
+        .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
+        .replace(/```html[\s\S]*?```/gi, '')
+        .replace(/<[^>]+>/g, '')
+        .trim();
+}
+
+function buildApiConfig(cfg) {
+    const out = {};
+    if (cfg.chatBase) out.chatBase = cfg.chatBase.trim();
+    if (cfg.chatKey) out.chatKey = cfg.chatKey.trim();
+    if (cfg.chatModel) out.chatModel = cfg.chatModel.trim();
+    if (cfg.embedBase) out.embedBase = cfg.embedBase.trim();
+    if (cfg.embedKey) out.embedKey = cfg.embedKey.trim();
+    if (cfg.embedModel) out.embedModel = cfg.embedModel.trim();
+    if (cfg.rerankModel) out.rerankModel = cfg.rerankModel.trim();
+    return out;
+}
+
+globalThis.gf2RagInterceptor = async function (chat, _contextSize, _abort, type) {
+    const cfg = getSettings();
+    if (!cfg.enabled || type === 'quiet') {
+        setExtensionPrompt(PROMPT_TAG, '', extension_prompt_types.IN_CHAT, cfg.depth, false, extension_prompt_roles.SYSTEM);
+        return;
+    }
+
+    const recent = (chat || []).filter(m => !m.is_system && m.mes).slice(-4);
+    if (!recent.length) return;
+
+    const lastMsg = cleanMessage(recent[recent.length - 1].mes);
+    if (!lastMsg || lastMsg.length < 2) return;
+
+    const contextMsgs = recent.slice(0, -1).map(m => `${m.name}: ${cleanMessage(m.mes).slice(0, 250)}`).join('\n');
+    const server = (cfg.ragServer || 'http://127.0.0.1:5240').replace(/\/+$/, '');
+
+    try {
+        const resp = await fetch(`${server}/search`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                query: lastMsg.slice(0, 500),
+                context: contextMsgs,
+                augment: cfg.augment,
+                useRerank: cfg.useRerank,
+                k: cfg.topK,
+                apiConfig: buildApiConfig(cfg),
+            }),
+        });
+        if (!resp.ok) return;
+        const data = await resp.json();
+
+        if (data.rerank === 'skipped_by_gatekeeper' || !Array.isArray(data.results) || !data.results.length) {
+            console.log('[GF2-RAG] Skipped or empty results', data);
+            setExtensionPrompt(PROMPT_TAG, '', extension_prompt_types.IN_CHAT, cfg.depth, false, extension_prompt_roles.SYSTEM);
+            return;
+        }
+
+        const hits = data.results.filter(r => r.score >= cfg.minScore);
+        if (!hits.length) {
+            setExtensionPrompt(PROMPT_TAG, '', extension_prompt_types.IN_CHAT, cfg.depth, false, extension_prompt_roles.SYSTEM);
+            return;
+        }
+
+        const block = hits.map((h, i) => `【原文片段 ${i + 1} | ${h.tag || h.group}】\n${h.text}`).join('\n\n');
+        const promptText = `<gf2_source_reference>\n以下是检索到的《少女前线2：追放》相关原作台词与设定片段，仅供剧情事实、细节与角色声口参考（请自然融入扮演，不要照搬旁白或复读）：\n\n${block}\n</gf2_source_reference>`;
+
+        console.log(`[GF2-RAG] Injected ${hits.length} chunks (${data.took_ms}ms) keywords:`, data.keywords);
+        setExtensionPrompt(PROMPT_TAG, promptText, extension_prompt_types.IN_CHAT, cfg.depth, false, extension_prompt_roles.SYSTEM);
+    } catch (err) {
+        console.warn('[GF2-RAG] Search failed (is serve.js running on :5240?):', err);
+    }
+};
+
+jQuery(async () => {
+    const cfg = getSettings();
+    const server = (cfg.ragServer || 'http://127.0.0.1:5240').replace(/\/+$/, '');
+
+    try {
+        const r = await fetch(`${server}/config`);
+        if (r.ok) {
+            const srvCfg = await r.json();
+            if (!cfg.chatKey && srvCfg.chatKey) cfg.chatKey = srvCfg.chatKey;
+            if (!cfg.embedKey && srvCfg.embedKey) cfg.embedKey = srvCfg.embedKey;
+            if (srvCfg.chatBase) cfg.chatBase = srvCfg.chatBase;
+            if (srvCfg.chatModel) cfg.chatModel = srvCfg.chatModel;
+            if (srvCfg.embedBase) cfg.embedBase = srvCfg.embedBase;
+            if (srvCfg.embedModel) cfg.embedModel = srvCfg.embedModel;
+            if (srvCfg.rerankModel) cfg.rerankModel = srvCfg.rerankModel;
+        }
+    } catch (_) {}
+
+    const html = `
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>GF2 原文检索桥 (RAG :5240)</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content" style="display:flex;flex-direction:column;gap:8px;padding:8px 4px;">
+            <label class="checkbox_label">
+                <input id="gf2_rag_enabled" type="checkbox" ${cfg.enabled ? 'checked' : ''} />
+                <span><b>启用生成前自动检索注入</b></span>
+            </label>
+            <label class="checkbox_label" title="开启后每轮先调小模型读28章目录生成关键词（每次耗约2k tokens）；关闭则直接用Rerank分数过滤（0 LLM token消耗）">
+                <input id="gf2_rag_augment" type="checkbox" ${cfg.augment ? 'checked' : ''} />
+                <span>启用小模型守门员扩写 (耗 LLM Token；关闭则零LLM消耗直查)</span>
+            </label>
+            <label class="checkbox_label">
+                <input id="gf2_rag_rerank" type="checkbox" ${cfg.useRerank ? 'checked' : ''} />
+                <span>启用 Reranker 重排序</span>
+            </label>
+
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                <div>
+                    <small>本地 RAG 服务地址：</small>
+                    <input id="gf2_rag_server" class="text_pole" type="text" value="${cfg.ragServer}" style="width:190px;display:inline-block;" />
+                </div>
+                <div>
+                    <small>Top-K：</small>
+                    <input id="gf2_rag_topk" class="text_pole" type="number" min="1" max="8" value="${cfg.topK}" style="width:55px;display:inline-block;" />
+                </div>
+                <div>
+                    <small>最低分阈值：</small>
+                    <input id="gf2_rag_minscore" class="text_pole" type="number" step="0.05" min="0" max="1" value="${cfg.minScore}" style="width:65px;display:inline-block;" />
+                </div>
+            </div>
+
+            <hr style="margin:4px 0;opacity:0.3;" />
+            <div style="font-weight:bold;font-size:0.9em;">① 守门员/关键词小模型配置 (仅开启守门员时调用)</div>
+            <div>
+                <small>API Base URL (OpenAI 兼容)：</small>
+                <input id="gf2_rag_chat_base" class="text_pole" type="text" value="${cfg.chatBase}" placeholder="https://api.xxx.com/v1" />
+            </div>
+            <div>
+                <small>API Key：</small>
+                <input id="gf2_rag_chat_key" class="text_pole" type="password" value="${cfg.chatKey}" placeholder="sk-..." />
+            </div>
+            <div style="display:flex;gap:6px;align-items:center;">
+                <div style="flex:1;">
+                    <small>模型名称：</small>
+                    <input id="gf2_rag_chat_model" class="text_pole" type="text" value="${cfg.chatModel}" list="gf2_rag_chat_model_list" />
+                    <datalist id="gf2_rag_chat_model_list"></datalist>
+                </div>
+                <button id="gf2_rag_fetch_models" class="menu_button" style="width:auto;margin-top:16px;padding:4px 8px;">拉取模型列表</button>
+            </div>
+
+            <hr style="margin:4px 0;opacity:0.3;" />
+            <div style="font-weight:bold;font-size:0.9em;">② Embedding & Rerank 配置 (SiliconFlow 等)</div>
+            <div>
+                <small>向量/重排 Base URL：</small>
+                <input id="gf2_rag_embed_base" class="text_pole" type="text" value="${cfg.embedBase}" placeholder="https://api.siliconflow.cn/v1" />
+            </div>
+            <div>
+                <small>向量/重排 API Key：</small>
+                <input id="gf2_rag_embed_key" class="text_pole" type="password" value="${cfg.embedKey}" placeholder="sk-..." />
+            </div>
+            <div style="display:flex;gap:6px;">
+                <div style="flex:1;">
+                    <small>Embedding 模型 (需4096维兼容)：</small>
+                    <input id="gf2_rag_embed_model" class="text_pole" type="text" value="${cfg.embedModel}" />
+                </div>
+                <div style="flex:1;">
+                    <small>Rerank 模型：</small>
+                    <input id="gf2_rag_rerank_model" class="text_pole" type="text" value="${cfg.rerankModel}" />
+                </div>
+            </div>
+
+            <div style="display:flex;gap:8px;margin-top:4px;">
+                <button id="gf2_rag_save_srv" class="menu_button" style="flex:1;">保存配置到 :5240 服务端</button>
+                <button id="gf2_rag_test_btn" class="menu_button" style="flex:1;">测试检索</button>
+            </div>
+            <div id="gf2_rag_status" style="font-size:0.82em;color:#aaa;white-space:pre-wrap;max-height:160px;overflow:auto;"></div>
+        </div>
+    </div>`;
+
+    $('#extensions_settings2').append(html);
+
+    const bind = (sel, key, fn) => {
+        $(sel).on('change input', function () {
+            cfg[key] = fn ? fn($(this)) : $(this).val();
+            saveSettingsDebounced();
+        });
+    };
+    bind('#gf2_rag_enabled', 'enabled', el => el.prop('checked'));
+    bind('#gf2_rag_augment', 'augment', el => el.prop('checked'));
+    bind('#gf2_rag_rerank', 'useRerank', el => el.prop('checked'));
+    bind('#gf2_rag_server', 'ragServer');
+    bind('#gf2_rag_topk', 'topK', el => Number(el.val()) || 3);
+    bind('#gf2_rag_minscore', 'minScore', el => Number(el.val()) || 0.35);
+    bind('#gf2_rag_chat_base', 'chatBase');
+    bind('#gf2_rag_chat_key', 'chatKey');
+    bind('#gf2_rag_chat_model', 'chatModel');
+    bind('#gf2_rag_embed_base', 'embedBase');
+    bind('#gf2_rag_embed_key', 'embedKey');
+    bind('#gf2_rag_embed_model', 'embedModel');
+    bind('#gf2_rag_rerank_model', 'rerankModel');
+
+    $('#gf2_rag_fetch_models').on('click', async () => {
+        const st = $('#gf2_rag_status');
+        st.text('正在拉取模型列表...');
+        try {
+            const srv = (cfg.ragServer || 'http://127.0.0.1:5240').replace(/\/+$/, '');
+            const r = await fetch(`${srv}/models`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ baseUrl: cfg.chatBase, apiKey: cfg.chatKey }),
+            });
+            const j = await r.json();
+            if (!j.ok) throw new Error(j.error || 'failed');
+            const dl = $('#gf2_rag_chat_model_list').empty();
+            for (const m of j.models) dl.append(`<option value="${m}"></option>`);
+            st.text(`已拉取 ${j.models.length} 个模型（点击模型输入框可下拉选择）`);
+        } catch (e) {
+            st.text('拉取失败: ' + e.message);
+        }
+    });
+
+    $('#gf2_rag_save_srv').on('click', async () => {
+        const st = $('#gf2_rag_status');
+        try {
+            const srv = (cfg.ragServer || 'http://127.0.0.1:5240').replace(/\/+$/, '');
+            const r = await fetch(`${srv}/config`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(buildApiConfig(cfg)),
+            });
+            const j = await r.json();
+            st.text(j.ok ? '已保存到服务端 D:/gf2-work/gf2-rag/config.json' : ('保存失败: ' + j.error));
+        } catch (e) {
+            st.text('连接 :5240 失败: ' + e.message);
+        }
+    });
+
+    $('#gf2_rag_test_btn').on('click', async () => {
+        const q = prompt('输入测试查询语句：', '克莱妲在新威尼斯水下中了什么病毒');
+        if (!q) return;
+        const st = $('#gf2_rag_status');
+        st.text('正在检索...');
+        try {
+            const srv = (cfg.ragServer || 'http://127.0.0.1:5240').replace(/\/+$/, '');
+            const r = await fetch(`${srv}/search`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    query: q,
+                    augment: cfg.augment,
+                    useRerank: cfg.useRerank,
+                    k: cfg.topK,
+                    apiConfig: buildApiConfig(cfg),
+                }),
+            });
+            const j = await r.json();
+            const lines = [`耗时: ${j.took_ms}ms | 状态: ${j.rerank} | 关键词: ${(j.keywords || []).join(', ') || '无'}`];
+            for (const h of j.results || []) {
+                lines.push(`[${h.group} | 分数 ${h.score}] ${h.text.slice(0, 90).replace(/\n/g, ' ')}...`);
+            }
+            st.text(lines.join('\n'));
+        } catch (e) {
+            st.text('检索失败: ' + e.message);
+        }
+    });
+});
