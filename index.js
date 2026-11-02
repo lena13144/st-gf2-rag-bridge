@@ -189,7 +189,7 @@ async function runRagRetrieval(loreData) {
             const povNote = (cfg.pov && h.present === false) ? `（${cfg.pov}不在场·转述记忆）` : '';
             return `【原文片段 ${i + 1} | ${h.era || ''}${h.tag || h.group}${cast ? ' | ' + cast : ''}${povNote}】\n${h.text}`;
         }).join('\n\n');
-        const promptText = `<gf2_source_reference>\n以下是检索到的《少女前线2：追放》原作台词与设定片段（{{user}}的潜在记忆素材），请作为既视感/闪回自然融入扮演，不要照搬旁白或复读。注意片段的时间标签：同一角色在不同时期的立场与性格可能相反，以最新阶段为准，早期片段仅可作回忆对比：\n\n${block}\n</gf2_source_reference>`;
+        const promptText = `<gf2_source_reference>\n以下是检索到的《少女前线2：追放》原作台词与设定片段（{{user}}的潜在记忆素材），请作为既视感/闪回自然融入扮演，不要照搬旁白或复读。注意片段的时间标签：同一角色在不同时期的立场与性格可能相反，以最新阶段为准，早期片段仅可作回忆对比。片段未覆盖的更早时期（格里芬时代/少前1）设定可参照你自身知识，但如与片段冲突以片段为准：\n\n${block}\n</gf2_source_reference>`;
         console.log(`[GF2-RAG] Injected ${hits.length} chunks (${data.took_ms}ms)${retried ? ' [retry]' : ''} kws:`, data.keywords);
         setExtensionPrompt(PROMPT_TAG, promptText, extension_prompt_types.IN_CHAT, 0, false, extension_prompt_roles.SYSTEM);
     } catch (err) {
