@@ -100,8 +100,8 @@ async function genKeywordsViaDbPreset(cfg, query, context) {
     const model = dbApi?.model || cfg.chatModel || 'deepseek-v4.1-flash-1017';
     if (!base || !key) return { skip: true, kws: [] };
     const msgs = [
-        { role: 'system', content: '你是交火关键词生成助手。根据用户输入与剧情纪要，输出最相关的简洁关键词或短语用于检索召回，关键词只能放在 <keywords> 标签内，用中文逗号分隔；若纯属日常闲聊无需检索则输出 NONE。' },
-        { role: 'user', content: (context ? context + '\n\n' : '') + '当前用户输入：\n' + query + '\n\n请输出 <keywords>。' },
+        { role: 'system', content: '你是交火关键词生成助手。根据用户输入与剧情纪要输出检索信息：\n1) 检索关键词放 <keywords> 内，中文逗号分隔。若问题涉及同一人/事的不同阶段或需要双角度（如"经历了什么"），可输出第二组 <keywords2>。\n2) 可选：在 <hyde> 内写一句"理想答案片段"（可虚构，仅用于语义召回）。\n3) 纯属日常闲聊无需检索则输出 NONE。' },
+        { role: 'user', content: (context ? context + '\n\n' : '') + '当前用户输入：\n' + query + '\n\n请输出。' },
     ];
     const resp = await fetch(base + '/chat/completions', {
         method: 'POST',
@@ -110,11 +110,10 @@ async function genKeywordsViaDbPreset(cfg, query, context) {
     });
     if (!resp.ok) return { skip: false, kws: [] };
     const text = (await resp.json())?.choices?.[0]?.message?.content || '';
-    const km = text.match(/<keywords>([\s\S]*?)<\/keywords>/i) || text.match(/关键词[：:]([\s\S]+)$/);
-    if (!km) return { skip: false, kws: [] };
-    const raw = km[1].trim();
-    if (/^none$/i.test(raw)) return { skip: true, kws: [] };
-    return { skip: false, kws: raw.split(/[，,、]/).map(x => x.trim()).filter(Boolean) };
+    if (/NONE/i.test(text) && !/<keywords>/i.test(text)) return { skip: true, kws: [] };
+    const pick = (tag) => { const m = text.match(new RegExp('<' + tag + '>([\\s\\S]*?)</' + tag + '>', 'i')); return m ? m[1].split(/[，,、]/).map(x => x.trim()).filter(Boolean) : []; };
+    const hyde = (text.match(/<hyde>([\s\S]*?)<\/hyde>/i) || [])[1]?.trim() || '';
+    return { skip: false, kws: pick('keywords'), kws2: pick('keywords2'), hyde };
 }
 
 let gf2RagRunning = false;
@@ -135,39 +134,58 @@ async function runRagRetrieval(loreData) {
             ? '【本轮世界书/纪要注入】\n' + entryTexts.join('\n').replace(/<[^>]+>/g, '')
             : '';
 
-        let kws = [];
+        let kws = [], kws2 = [], hyde = '', retried = false;
         if (cfg.augment) {
             try {
                 const gk = await genKeywordsViaDbPreset(cfg, query, context);
                 if (gk.skip) { console.debug('[GF2-RAG] gatekeeper: NONE'); clear(); return; }
-                kws = gk.kws;
+                kws = gk.kws; kws2 = gk.kws2 || []; hyde = gk.hyde || '';
             } catch (e) { console.warn('[GF2-RAG] keyword gen failed, fallback to raw query', e); }
         }
 
         const server = (cfg.ragServer || 'http://127.0.0.1:5240').replace(/\/+$/, '');
-        const resp = await fetch(`${server}/search`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                query, context, keywords: kws,
-                augment: false,
-                useRerank: cfg.useRerank,
-                k: cfg.topK,
-                apiConfig: buildApiConfig(cfg),
-            }),
-        });
-        if (!resp.ok) return;
-        const data = await resp.json();
+        const doSearch = async (kwA, kwB, hy) => {
+            const queries = [];
+            if (kwB.length) queries.push(query + '\n关键词：' + kwB.join('，'));
+            const resp = await fetch(`${server}/search`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    query, context, keywords: kwA, queries, hyde: hy,
+                    augment: false,
+                    useRerank: cfg.useRerank,
+                    k: cfg.topK,
+                    apiConfig: buildApiConfig(cfg),
+                }),
+            });
+            if (!resp.ok) return null;
+            return resp.json();
+        };
+        let data = await doSearch(kws, kws2, hyde);
+        if (!data) return;
+
+        // 自校正：守门员开启且所有命中低于阈值时，换思路重查一次（多 ~1s）
+        const goodHits = (d) => (d?.results || []).filter(r => r.score >= cfg.minScore);
+        if (cfg.augment && !goodHits(data).length && (data.results || []).length) {
+            console.debug('[GF2-RAG] low-score hits, self-correcting retry…');
+            try {
+                const gk2 = await genKeywordsViaDbPreset(cfg, query + '\n（上次检索未命中相关剧情，请换角度/更早阶段重新生成）', context);
+                if (!gk2.skip && gk2.kws.length) {
+                    data = await doSearch(gk2.kws, gk2.kws2 || [], gk2.hyde || '');
+                    retried = true;
+                }
+            } catch (e) { console.warn('[GF2-RAG] retry failed', e); }
+        }
 
         if (data.rerank === 'skipped_by_gatekeeper' || !Array.isArray(data.results) || !data.results.length) {
             clear(); return;
         }
-        const hits = data.results.filter(r => r.score >= cfg.minScore);
+        const hits = goodHits(data);
         if (!hits.length) { clear(); return; }
 
         const block = hits.map((h, i) => `【原文片段 ${i + 1} | ${h.era || ''}${h.tag || h.group}】\n${h.text}`).join('\n\n');
-        const promptText = `<gf2_source_reference>\n以下是检索到的《少女前线2：追放》原作台词与设定片段（{{user}}的潜在记忆素材），请作为既视感/闪回自然融入扮演，不要照搬旁白或复读：\n\n${block}\n</gf2_source_reference>`;
-        console.log(`[GF2-RAG] Injected ${hits.length} chunks (${data.took_ms}ms) kws:`, data.keywords);
+        const promptText = `<gf2_source_reference>\n以下是检索到的《少女前线2：追放》原作台词与设定片段（{{user}}的潜在记忆素材），请作为既视感/闪回自然融入扮演，不要照搬旁白或复读。注意片段的时间标签：同一角色在不同时期的立场与性格可能相反，以最新阶段为准，早期片段仅可作回忆对比：\n\n${block}\n</gf2_source_reference>`;
+        console.log(`[GF2-RAG] Injected ${hits.length} chunks (${data.took_ms}ms)${retried ? ' [retry]' : ''} kws:`, data.keywords);
         setExtensionPrompt(PROMPT_TAG, promptText, extension_prompt_types.IN_CHAT, 0, false, extension_prompt_roles.SYSTEM);
     } catch (err) {
         console.warn('[GF2-RAG] retrieval failed:', err);
