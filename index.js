@@ -20,6 +20,7 @@ const defaultSettings = {
     useRerank: true,
     topK: 3,
     minScore: 0.35,
+    pov: '',
     depth: 1,
     chatBase: 'https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1',
     chatKey: '',
@@ -151,7 +152,7 @@ async function runRagRetrieval(loreData) {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    query, context, keywords: kwA, queries, hyde: hy,
+                    query, context, keywords: kwA, queries, hyde: hy, pov: cfg.pov || '',
                     augment: false,
                     useRerank: cfg.useRerank,
                     k: cfg.topK,
@@ -183,7 +184,11 @@ async function runRagRetrieval(loreData) {
         const hits = goodHits(data);
         if (!hits.length) { clear(); return; }
 
-        const block = hits.map((h, i) => `【原文片段 ${i + 1} | ${h.era || ''}${h.tag || h.group}】\n${h.text}`).join('\n\n');
+        const block = hits.map((h, i) => {
+            const cast = h.cast ? `在场:${h.cast}` : '';
+            const povNote = (cfg.pov && h.present === false) ? `（${cfg.pov}不在场·转述记忆）` : '';
+            return `【原文片段 ${i + 1} | ${h.era || ''}${h.tag || h.group}${cast ? ' | ' + cast : ''}${povNote}】\n${h.text}`;
+        }).join('\n\n');
         const promptText = `<gf2_source_reference>\n以下是检索到的《少女前线2：追放》原作台词与设定片段（{{user}}的潜在记忆素材），请作为既视感/闪回自然融入扮演，不要照搬旁白或复读。注意片段的时间标签：同一角色在不同时期的立场与性格可能相反，以最新阶段为准，早期片段仅可作回忆对比：\n\n${block}\n</gf2_source_reference>`;
         console.log(`[GF2-RAG] Injected ${hits.length} chunks (${data.took_ms}ms)${retried ? ' [retry]' : ''} kws:`, data.keywords);
         setExtensionPrompt(PROMPT_TAG, promptText, extension_prompt_types.IN_CHAT, 0, false, extension_prompt_roles.SYSTEM);
@@ -218,6 +223,18 @@ jQuery(async () => {
             return cfg.enabled ? 'on' : 'off';
         },
         helpString: 'GF2 原文检索桥开关：/gf2rag on|off（不带参数则切换）',
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'gf2pov',
+        returns: '检索视角角色名',
+        callback: (_args, value) => {
+            cfg.pov = String(value || '').trim();
+            saveSettingsDebounced();
+            toastr.info(`GF2 检索视角：${cfg.pov || '（无）'}`);
+            return cfg.pov;
+        },
+        helpString: '设置检索视角角色：/gf2pov 莱娅（检索优先她出场的原文块，她缺席的标注"转述记忆"）；/gf2pov（空值清除）',
     }));
 
     try {
