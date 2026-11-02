@@ -165,7 +165,7 @@ async function runRagRetrieval(loreData) {
         const hits = data.results.filter(r => r.score >= cfg.minScore);
         if (!hits.length) { clear(); return; }
 
-        const block = hits.map((h, i) => `【原文片段 ${i + 1} | ${h.tag || h.group}】\n${h.text}`).join('\n\n');
+        const block = hits.map((h, i) => `【原文片段 ${i + 1} | ${h.era || ''}${h.tag || h.group}】\n${h.text}`).join('\n\n');
         const promptText = `<gf2_source_reference>\n以下是检索到的《少女前线2：追放》原作台词与设定片段（{{user}}的潜在记忆素材），请作为既视感/闪回自然融入扮演，不要照搬旁白或复读：\n\n${block}\n</gf2_source_reference>`;
         console.log(`[GF2-RAG] Injected ${hits.length} chunks (${data.took_ms}ms) kws:`, data.keywords);
         setExtensionPrompt(PROMPT_TAG, promptText, extension_prompt_types.IN_CHAT, 0, false, extension_prompt_roles.SYSTEM);
