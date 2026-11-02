@@ -7,8 +7,8 @@ import {
     event_types,
 } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
-import { SlashCommand } from '../../slash-commands/SlashCommand.js';
-import { SlashCommandParser } from '../../slash-commands/SlashCommandParser.js';
+import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
+import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 
 const MODULE_NAME = 'gf2_rag_bridge';
 const PROMPT_TAG = 'gf2_rag_context';
